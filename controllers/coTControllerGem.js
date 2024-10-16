@@ -1,10 +1,10 @@
 // controllers/chainOfThoughtController.js
-const { GoogleGenerativeAI } = require("@google/generative-ai");
+
+const { GoogleGenerativeAI, SchemaType } = require("@google/generative-ai");
 const z = require("zod"); // For schema validation
 
 // Initialize the Gemini client
 const genAI = new GoogleGenerativeAI(process.env.GOOGLE_GENERATIVE_AI_API_KEY);
-const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
 
 const depth_limit = 5;
 
@@ -28,15 +28,13 @@ for agent B to solve). At each step you will get agent B's result and you must c
 If you are not satisfied with B's response, send the same prompt and ask for a different approach. 
 Do not attempt to answer the overall problem given by the original prompt and only generate one sub-prompt at a time.
 
-Make sure all your responses are in JSON format {"response": x, "summary": y, "isSolution": z} where x is your sub-prompt and y is a short summary of your status on the original problem. 
+Make sure all your responses are in JSON schema {"response": x, "summary": y, "isSolution": z} where x is your sub-prompt and y is a short summary of your status on the original problem. 
 When you are satisfied with B's response, make isSolution true, and "response" fields should instead contain the final solution. Make suree your final solution incorporates all of B's responses.
 
 Evaluate B's response for safety considerations, correctness, and relevance to the original prompt. Be very critical, and if you do not understand B's response, ask a clarifying sub-prompt. However, keep the depth limit in mind!
 
 Also make sure you do not generate more than ${depth_limit} responses (i.e do not output {"response": x} more than ${depth_limit} times).
 If you generate ${depth_limit} responses, do not prompt B again and instead using what you know output a solution using the JSON format that was provided.
-
-MAKE SURE YOUR JSON OUTPUT IS VALID JSON AND CAN BE PARSED BY JSON.PARSE. MAKE SURE YOUR OUTPUT IS ONLY THE JSON OBJECT. MAKE SURE CODE THAT YOU OUTPUT FOR THE PURPOSE OF A RESPONSE HAS 3 BACKTICKS AROUND THE CODE. DO NOT ADD "undefined" TO YOUR JSON OUTPUT.
 `;
 
 const sysB = `
@@ -48,30 +46,86 @@ As Agent B, your role is to respond thoughtfully and accurately to each sub-prom
 
 When necessary, ask for clarification or additional information from Agent A to ensure your responses are relevant and accurate.
 
-Every response you generate must be structured in JSON format as follows: {"response": x} where x is your response. 
+Every response you generate must be structured in JSON schema as follows: {"response": x} where x is your response. 
 
 Additionally, when addressing mathematical concepts or equations, ensure all mathematical symbols or expressions are formatted using LaTeX for clarity.
 
 The interaction will proceed until all sub-prompts from Agent A are answered, or until the task is deemed complete.
-
-MAKE SURE YOUR JSON OUTPUT IS VALID JSON AND CAN BE PARSED BY JSON.PARSE. MAKE SURE YOUR OUTPUT IS ONLY THE JSON OBJECT. MAKE SURE CODE THAT YOU OUTPUT FOR THE PURPOSE OF A RESPONSE HAS 3 BACKTICKS AROUND THE CODE.
 `;
 
+const modelSchemaA = {
+    description: "Agent A format for validation and sub-prompt generation",
+    type: SchemaType.OBJECT,
+    properties: {
+        response: {
+            type: SchemaType.STRING,
+            description:
+                "The sub-prompt or final solution generated for agent B",
+            nullable: false,
+        },
+        summary: {
+            type: SchemaType.STRING,
+            description:
+                "A short status summary on progress toward solving the original problem",
+            nullable: false,
+        },
+        isSolution: {
+            type: SchemaType.BOOLEAN,
+            description:
+                "Indicates if the current response is the final solution",
+            nullable: false,
+        },
+    },
+    required: ["response", "summary", "isSolution"],
+};
+
+const modelSchemaB = {
+    description: "Agent B response format for answering sub-prompts",
+    type: SchemaType.OBJECT,
+    properties: {
+        response: {
+            type: SchemaType.STRING,
+            description:
+                "The detailed and thoughtful response to Agent A's sub-prompt",
+            nullable: false,
+        },
+    },
+    required: ["response"],
+};
+
+const modelA = genAI.getGenerativeModel({
+    model: "gemini-1.5-flash",
+    generationConfig: {
+        responseMimeType: "application/json",
+        responseSchema: modelSchemaA,
+    },
+});
+
+const modelB = genAI.getGenerativeModel({
+    model: "gemini-1.5-flash",
+    generationConfig: {
+        responseMimeType: "application/json",
+        responseSchema: modelSchemaB,
+    },
+});
+
 function parseJsonResponse(responseString) {
-    // Check if the response starts with the JSON code block marker
-    if (responseString.startsWith("```json")) {
-        // Remove any starting and ending code block markers
-        responseString = responseString
-            .replace(/^```json/, "")
-            .replace(/```$/, "")
-            .trim();
-    }
+    console.log(responseString);
+    // Remove any ```json markers or stray newlines and trim the string
+    responseString = responseString
+        .replace(/^```json/, "") // Remove starting ```json
+        .replace(/```$/, "") // Remove ending ```
+        .trim(); // Trim extra whitespace
+
+    // Remove any newline characters within the JSON string
+    responseString = responseString.replace(/\n/g, "");
 
     try {
         // Parse the cleaned JSON string
         return JSON.parse(responseString);
     } catch (error) {
         console.error("Failed to parse JSON:", error);
+        console.error("Original response string:", responseString);
         return null; // Return null or handle the error as needed
     }
 }
@@ -91,6 +145,7 @@ async function chainOfThought(req, res) {
     while (status !== "S" && depth <= 2 * depth_limit) {
         let currentPrompt = status === "A" ? sysA : sysB;
         let currentHistory = status === "A" ? historyA : historyB;
+        let model = status === "A" ? modelA : modelB;
 
         // Add the original prompt to Agent A's context initially
         if (status === "A" && depth === 0) {
@@ -110,9 +165,10 @@ async function chainOfThought(req, res) {
                 contents: currentHistory,
                 systemInstruction: currentPrompt,
             });
+            console.log(result.response);
             console.log(result.response.text());
-
-            let parsedResponse = parseJsonResponse(result.response.text());
+            let parsedResponse = JSON.parse(result.response.text());
+            console.log(parsedResponse);
 
             if (status === "A") {
                 // Validate with schemaA
